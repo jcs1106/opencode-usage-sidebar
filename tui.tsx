@@ -1,3 +1,5 @@
+/** @jsxImportSource @opentui/solid */
+
 import { Plugin } from "@opencode/plugin/tui"
 import { createSignal } from "solid-js"
 import { appendFileSync, mkdirSync } from "node:fs"

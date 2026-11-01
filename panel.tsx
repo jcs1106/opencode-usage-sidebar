@@ -1,3 +1,5 @@
+/** @jsxImportSource @opentui/solid */
+
 import { For, Show, createMemo, onMount } from "solid-js"
 import type { Accessor } from "solid-js"
 import { usePlugin } from "@opencode/plugin/tui"
