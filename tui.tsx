@@ -5,25 +5,31 @@ import { createSignal } from "solid-js"
 import { appendFileSync, mkdirSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { homedir } from "node:os"
-import { UsagePanel } from "./panel"
+import { UsagePanel } from "./panel.js"
 import {
   errorText,
   estimateTokens,
-  fetchModelPrices,
+  fetchModelCatalog,
   fetchQuota,
   fetchStats,
   modelKey,
   MIN_RATE_TOKENS,
-  type ModelCost,
+  type ModelEntry,
   type QuotaState,
   type RateState,
   type StatsState,
-} from "./data"
+  type StatsToolsMode,
+} from "./data.js"
+import { isFontSize, type FontSize } from "./format.js"
 
 const DEFAULT_SECTIONS = ["go", "session", "today", "week", "month"]
 const DEFAULT_REFRESH_MS = 60_000
 const STATS_DEBOUNCE_MS = 5_000
-const RATE_TICK_MS = 250
+const QUOTA_DEBOUNCE_MS = 5_000
+const CLOCK_TICK_MS = 1_000
+const RATE_TICK_MS = 1_000
+/** Live rates need at least this much streamed wall time; shorter windows inflate badly. */
+const MIN_LIVE_SPAN_MS = 1_000
 
 type InternalRate = {
   sessionID: string
@@ -38,6 +44,14 @@ type InternalRate = {
   samples: number[]
   at?: number
   loggedLive?: boolean
+  firstOutputAt?: number
+  ttft?: number
+  peak?: number
+  tools: number
+  toolFailures: number
+  failures: number
+  retries: number
+  compactions: number
 }
 
 function debugLogger(): (message: string) => void {
@@ -74,17 +88,31 @@ export default Plugin.define({
     const log = options.debug === true ? debugLogger() : undefined
     const refreshMs = clampRefresh(Number(options.refreshMs ?? DEFAULT_REFRESH_MS))
     const rateWindowMs = clampWindow(Number(options.rateWindowMs ?? 4000))
-    const rateIncludeTools = options.rateIncludeTools !== false
+    const rateIncludeTools = options.rateIncludeTools === true
     const showRate = options.showRate !== false
+    const fontSize: FontSize = isFontSize(options.fontSize) ? options.fontSize : "md"
+    const statsTools: StatsToolsMode =
+      options.statsTools === "none" || options.statsTools === "detail"
+        ? options.statsTools
+        : "summary"
     const sections = new Set<string>(
       Array.isArray(options.sections) ? options.sections.map(String) : DEFAULT_SECTIONS,
     )
+
+    const [view, setView] = context.storage.store("usage-sidebar.view", {
+      initial: { collapsed: options.collapsed === true },
+    })
+    const toggle = () => {
+      void setView((draft) => {
+        draft.collapsed = !draft.collapsed
+      })
+    }
 
     const [quota, setQuota] = createSignal<QuotaState>({ data: null, loading: true })
     const [stats, setStats] = createSignal<StatsState>({ ranges: [], loading: true })
     const [version, setVersion] = createSignal(0)
     const [rates, setRates] = createSignal<Map<string, RateState>>(new Map())
-    const [prices, setPrices] = createSignal<Map<string, ModelCost[]>>(new Map())
+    const [models, setModels] = createSignal<Map<string, ModelEntry>>(new Map())
 
     const location = context.location ?? context.data.location.default()
     const rateEntries = new Map<string, InternalRate>()
@@ -93,8 +121,11 @@ export default Plugin.define({
     let disposed = false
     let interval: ReturnType<typeof setInterval> | undefined
     let rateTimer: ReturnType<typeof setInterval> | undefined
+    let clockTimer: ReturnType<typeof setInterval> | undefined
     let statsTimer: ReturnType<typeof setTimeout> | undefined
     let statsScheduled = false
+    let quotaTimer: ReturnType<typeof setTimeout> | undefined
+    let quotaScheduled = false
     let quotaController: AbortController | undefined
     let statsController: AbortController | undefined
     let ratesDirty = false
@@ -120,6 +151,11 @@ export default Plugin.define({
         window: [],
         stepChars: 0,
         samples: [],
+        tools: 0,
+        toolFailures: 0,
+        failures: 0,
+        retries: 0,
+        compactions: 0,
       }
       rateEntries.set(sessionID, entry)
       return entry
@@ -133,8 +169,9 @@ export default Plugin.define({
     const liveRate = (entry: InternalRate, now: number): number | undefined => {
       trimWindow(entry, now)
       if (entry.window.length === 0) return undefined
+      const span = now - entry.window[0].at
+      if (span < MIN_LIVE_SPAN_MS) return undefined
       const tokens = entry.window.reduce((sum, sample) => sum + sample.tokens, 0)
-      const span = Math.max(500, now - entry.window[0].at)
       return tokens / (span / 1000)
     }
 
@@ -143,13 +180,22 @@ export default Plugin.define({
       ratesDirty = false
       const next = new Map<string, RateState>()
       for (const [sessionID, entry] of rateEntries) {
-        if (!entry.active && entry.exact === undefined) continue
+        const counters =
+          entry.tools + entry.toolFailures + entry.failures + entry.retries + entry.compactions
+        if (!entry.active && entry.exact === undefined && counters === 0) continue
         next.set(sessionID, {
           live: entry.live,
           exact: entry.exact,
           active: entry.active,
-          samples: entry.samples.slice(-8),
+          samples: entry.samples.slice(-12),
           at: entry.at,
+          ttft: entry.ttft,
+          peak: entry.peak,
+          tools: entry.tools,
+          toolFailures: entry.toolFailures,
+          failures: entry.failures,
+          retries: entry.retries,
+          compactions: entry.compactions,
         })
       }
       setRates(next)
@@ -161,16 +207,31 @@ export default Plugin.define({
       const ratio = entry.model ? charsPerToken.get(entry.model) : undefined
       const tokens = ratio ? delta.length / ratio : estimateTokens(delta)
       entry.stepChars += delta.length
-      entry.window.push({ at: Date.now(), tokens })
+      const now = Date.now()
+      entry.window.push({ at: now, tokens })
       if (entry.window.length > 800) entry.window.splice(0, entry.window.length - 800)
       entry.active = true
-      entry.at = Date.now()
-      entry.live = liveRate(entry, entry.at)
+      entry.at = now
+      entry.live = liveRate(entry, now)
+      if (entry.live !== undefined) {
+        entry.peak = Math.max(entry.peak ?? 0, entry.live)
+      }
       if (!entry.loggedLive && entry.live !== undefined) {
         entry.loggedLive = true
         log?.(`rate live ${sessionID} ${entry.live.toFixed(1)} tok/s`)
       }
       ratesDirty = true
+    }
+
+    /** Time to first streamed token for the current step. */
+    const markFirstOutput = (sessionID: string) => {
+      const entry = rateEntries.get(sessionID)
+      if (!entry || entry.firstOutputAt !== undefined) return
+      entry.firstOutputAt = Date.now()
+      if (entry.startedAt) {
+        entry.ttft = Math.max(0, (entry.firstOutputAt - entry.startedAt) / 1000)
+        ratesDirty = true
+      }
     }
 
     const finishRate = (sessionID: string) => {
@@ -179,7 +240,7 @@ export default Plugin.define({
       entry.active = false
       entry.live = undefined
       entry.window = []
-      entry.samples = []
+      // Keep `samples` so the panel can keep drawing the last step's curve.
       entry.at = Date.now()
       ratesDirty = true
     }
@@ -203,7 +264,7 @@ export default Plugin.define({
         setQuota((previous) => ({
           ...previous,
           loading: false,
-          fetchedAt: Date.now(),
+          // Keep the last successful timestamp so the age label does not lie after a failed poll.
           error: errorText(error),
         }))
       }
@@ -215,7 +276,7 @@ export default Plugin.define({
       statsController = controller
       setStats((previous) => ({ ...previous, loading: true }))
       try {
-        const next = await fetchStats(context.client, controller.signal)
+        const next = await fetchStats(context.client, controller.signal, Date.now(), statsTools)
         if (!disposed) setStats(next)
         const today = next.ranges.find((range) => range.key === "today")?.stats
         log?.(
@@ -229,7 +290,7 @@ export default Plugin.define({
         setStats((previous) => ({
           ...previous,
           loading: false,
-          fetchedAt: Date.now(),
+          // Keep the last successful timestamp so the age label does not lie after a failed poll.
           error: errorText(error),
         }))
       }
@@ -239,13 +300,13 @@ export default Plugin.define({
       await Promise.all([refreshQuota(), refreshStats()])
     }
 
-    const loadPrices = async () => {
+    const loadModels = async () => {
       try {
-        const next = await fetchModelPrices(context.client, location)
-        if (!disposed) setPrices(next)
-        log?.(`prices loaded=${next.size}`)
+        const next = await fetchModelCatalog(context.client, location)
+        if (!disposed) setModels(next)
+        log?.(`models loaded=${next.size}`)
       } catch (error) {
-        log?.(`prices error ${errorText(error)}`)
+        log?.(`models error ${errorText(error)}`)
       }
     }
 
@@ -259,8 +320,18 @@ export default Plugin.define({
       }, STATS_DEBOUNCE_MS)
     }
 
+    const scheduleQuota = () => {
+      if (disposed || quotaScheduled) return
+      quotaScheduled = true
+      quotaTimer = setTimeout(() => {
+        quotaScheduled = false
+        quotaTimer = undefined
+        if (!disposed) void refreshQuota()
+      }, QUOTA_DEBOUNCE_MS)
+    }
+
     void refreshAll()
-    void loadPrices()
+    void loadModels()
 
     interval = setInterval(() => {
       if (!disposed) void refreshAll()
@@ -286,8 +357,15 @@ export default Plugin.define({
       }
     }, RATE_TICK_MS)
 
+    // Repaint once a second so countdowns and data-freshness labels keep moving while idle.
+    clockTimer = setInterval(() => {
+      if (disposed) return
+      bump()
+    }, CLOCK_TICK_MS)
+
     const offUsage = context.data.on("session.usage.updated", () => {
       bump()
+      scheduleQuota()
       scheduleStats()
     })
     const offSucceeded = context.data.on("session.execution.succeeded", (event) => {
@@ -310,18 +388,19 @@ export default Plugin.define({
       finishRate(event.data.sessionID)
       publishRates(true)
       bump()
+      void refreshQuota()
       void refreshStats()
     })
     const offCredential = context.data.on("credential.updated", () => {
       void refreshQuota()
-      void loadPrices()
+      void loadModels()
     })
     const offSwitched = context.data.on("credential.switched", () => {
       void refreshQuota()
-      void loadPrices()
+      void loadModels()
     })
     const offModel = context.data.on("model.updated", () => {
-      void loadPrices()
+      void loadModels()
     })
 
     const offStepStarted = context.data.on("session.step.started", (event) => {
@@ -338,6 +417,9 @@ export default Plugin.define({
       entry.samples = []
       entry.at = Date.now()
       entry.loggedLive = false
+      entry.firstOutputAt = undefined
+      entry.ttft = undefined
+      entry.peak = undefined
       ratesDirty = true
       publishRates(true)
       log?.(`rate step start ${event.data.sessionID} ${entry.model ?? "?"}`)
@@ -369,7 +451,7 @@ export default Plugin.define({
       entry.active = false
       entry.live = undefined
       entry.window = []
-      entry.samples = []
+      // Keep `samples` so the idle panel still shows the finished step's curve.
       entry.at = Date.now()
       ratesDirty = true
       publishRates(true)
@@ -380,9 +462,11 @@ export default Plugin.define({
     })
 
     const offText = context.data.on("session.text.delta", (event) => {
+      markFirstOutput(event.data.sessionID)
       pushDelta(event.data.sessionID, event.data.delta)
     })
     const offReasoning = context.data.on("session.reasoning.delta", (event) => {
+      markFirstOutput(event.data.sessionID)
       pushDelta(event.data.sessionID, event.data.delta)
     })
     const offToolInput = rateIncludeTools
@@ -390,6 +474,39 @@ export default Plugin.define({
           pushDelta(event.data.sessionID, event.data.delta)
         })
       : undefined
+
+    const trackRate = (sessionID: string, update: (entry: InternalRate) => void) => {
+      update(ensureRate(sessionID))
+      ratesDirty = true
+      publishRates(true)
+      bump()
+    }
+
+    const offToolCalled = context.data.on("session.tool.called", (event) => {
+      trackRate(event.data.sessionID, (entry) => {
+        entry.tools += 1
+      })
+    })
+    const offToolFailed = context.data.on("session.tool.failed", (event) => {
+      trackRate(event.data.sessionID, (entry) => {
+        entry.toolFailures += 1
+      })
+    })
+    const offStepFailed = context.data.on("session.step.failed", (event) => {
+      trackRate(event.data.sessionID, (entry) => {
+        entry.failures += 1
+      })
+    })
+    const offRetry = context.data.on("session.retry.scheduled", (event) => {
+      trackRate(event.data.sessionID, (entry) => {
+        entry.retries += 1
+      })
+    })
+    const offCompaction = context.data.on("session.compaction.ended", (event) => {
+      trackRate(event.data.sessionID, (entry) => {
+        entry.compactions += 1
+      })
+    })
 
     context.keymap.layer(() => ({
       mode: "global",
@@ -408,9 +525,21 @@ export default Plugin.define({
               ? [`5h ${Math.round(go.rolling.percent)}%`, `周 ${Math.round(go.weekly.percent)}%`, `月 ${Math.round(go.monthly.percent)}%`]
               : []
             context.ui.toast.show({
-              message: summary.length > 0 ? `已刷新 · ${summary.join(" · ")}` : "已刷新用量",
+              message: summary.length > 0 ? `已刷新 ${summary.join(" ")}` : "已刷新用量",
               variant: "success",
             })
+          },
+        },
+        {
+          id: "usage-sidebar.toggle",
+          title: "折叠/展开用量面板",
+          description: "在概览与完整用量之间切换",
+          group: "Usage",
+          palette: true,
+          slash: { name: "usage-toggle" },
+          bind: false,
+          run: () => {
+            toggle()
           },
         },
       ],
@@ -426,8 +555,11 @@ export default Plugin.define({
           version={version}
           sections={sections}
           rates={rates}
-          prices={prices}
+          models={models}
           showRate={showRate}
+          fontSize={fontSize}
+          collapsed={() => view.collapsed}
+          onToggle={toggle}
           log={log}
         />
       ),
@@ -439,7 +571,9 @@ export default Plugin.define({
       disposed = true
       if (interval) clearInterval(interval)
       if (rateTimer) clearInterval(rateTimer)
+      if (clockTimer) clearInterval(clockTimer)
       if (statsTimer) clearTimeout(statsTimer)
+      if (quotaTimer) clearTimeout(quotaTimer)
       quotaController?.abort()
       statsController?.abort()
       offUsage()
@@ -455,6 +589,11 @@ export default Plugin.define({
       offText()
       offReasoning()
       offToolInput?.()
+      offToolCalled()
+      offToolFailed()
+      offStepFailed()
+      offRetry()
+      offCompaction()
       unregisterSlot()
     }
   },

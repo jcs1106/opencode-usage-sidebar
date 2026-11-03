@@ -58,12 +58,42 @@ export type ModelUsage = {
   cost: number
 }
 
+export type ToolTotals = {
+  calls: number
+  succeeded: number
+  failed: number
+  unfinished: number
+}
+
+export type ToolUsage = ToolTotals & {
+  name: string
+  durationP50?: number
+}
+
+export type StatsTools =
+  | { mode: "none" }
+  | { mode: "summary"; totals: ToolTotals }
+  | { mode: "detail"; totals: ToolTotals; usage: ToolUsage[] }
+
+export type StatsToolsMode = "none" | "summary" | "detail"
+
+export type StatsActivity = {
+  date: string
+  steps: number
+}
+
 export type SessionStats = {
   tokens: TokenUsage
   cost: number
   steps: number
   sessions: number
   models: ModelUsage[]
+  subagents?: number
+  prompts?: number
+  activeDays?: number
+  streak?: number
+  activity?: StatsActivity[]
+  tools?: StatsTools
 }
 
 export type RangeKey = "today" | "week" | "month"
@@ -106,12 +136,32 @@ export type ModelCost = {
   }
 }
 
+export type ModelLimit = {
+  context: number
+  output: number
+}
+
+export type ModelEntry = {
+  cost: ModelCost[]
+  limit?: ModelLimit
+  name?: string
+}
+
 export type RateState = {
   live?: number
   exact?: number
   active: boolean
   samples: number[]
   at?: number
+  /** Time to first streamed token for the current/last step, in seconds. */
+  ttft?: number
+  /** Highest sampled live rate for the current/last step, in tok/s. */
+  peak?: number
+  tools?: number
+  toolFailures?: number
+  failures?: number
+  retries?: number
+  compactions?: number
 }
 
 const CJK = /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff]/
@@ -159,19 +209,23 @@ export function estimateCost(tokens: TokenUsage | undefined, costs: readonly Mod
   )
 }
 
-export async function fetchModelPrices(
+export async function fetchModelCatalog(
   client: any,
   location: unknown,
-): Promise<Map<string, ModelCost[]>> {
-  const prices = new Map<string, ModelCost[]>()
+): Promise<Map<string, ModelEntry>> {
+  const catalog = new Map<string, ModelEntry>()
   const list = client?.model?.list
-  if (!list) return prices
+  if (!list) return catalog
   const response = await list.call(client.model, { location })
   for (const model of response?.data ?? []) {
     if (!model?.providerID || !model?.id) continue
-    prices.set(modelKey(model.providerID, model.id), model.cost ?? [])
+    catalog.set(modelKey(model.providerID, model.id), {
+      cost: model.cost ?? [],
+      limit: model.limit,
+      name: model.name,
+    })
   }
-  return prices
+  return catalog
 }
 
 export const RANGE_LABELS: ReadonlyArray<readonly [RangeKey, string]> = [
@@ -222,6 +276,7 @@ export async function fetchStats(
   client: any,
   signal: AbortSignal,
   now = Date.now(),
+  tools: StatsToolsMode = "summary",
 ): Promise<StatsState> {
   const session = client?.experimental?.session
   if (!session?.stats) {
@@ -233,7 +288,7 @@ export async function fetchStats(
   const ranges = await Promise.all(
     RANGE_LABELS.map(async ([key, label]) => {
       const stats = (await session.stats(
-        { from: starts[key], to: now, timezone, tools: "none" },
+        { from: starts[key], to: now, timezone, tools },
         { signal },
       )) as SessionStats
       return { key, label, from: starts[key], stats } satisfies RangeStats
